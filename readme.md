@@ -1,0 +1,2 @@
+This mod takes the concept of Track Compatible Items and fully realizes it:
+When you track an item, a gun or an armor, those tracked parts are highlighted in a color of your choosing. And, with this mod, when you hover over that highlighted item, it will show in its tooltip to which tracked item it is compatible

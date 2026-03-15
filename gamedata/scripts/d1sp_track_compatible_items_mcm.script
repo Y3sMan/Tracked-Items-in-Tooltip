@@ -1,0 +1,1265 @@
+--[[
+    author:
+        d1sasterpiece - 26/08/2023
+
+    amended:
+        29/08/2023 - adding support for tracking parts, gun attachments and ammo
+        30/08/2023 - mcm support for changing the colour of all compatible item highlights
+        02/09/2023 - adding support for tracking repair tools
+                   - adding support for localizing menu strings
+        07/09/2023 - Removing use of SYS_GetParam for parent_section
+                     For some reason using this caused another addon (outfit overhaul) to crash when hovering over exoskeleton
+                     No idea why this was the case - but swapping for "ini_sys:r_string_ex" fixes it
+                     Perhaps a caching issue based on function internals
+
+    name:
+        track compatible item upgrades
+
+    description:
+        Adds tracking capability to guns and armour so that any compatible upgrades in any bags
+        are highlighted
+]]
+
+local PRESET_NONE = "PRESET_NONE"
+local PRESET_SKY_BLUE = "PRESET_SKY_BLUE"
+local PRESET_GOLD = "PRESET_GOLD"
+local PRESET_CRIMSON = "PRESET_CRIMSON"
+local PRESET_WHITE = "PRESET_WHITE"
+local PRESET_PEACH = "PRESET_PEACH"
+local PRESET_VIOLET = "PRESET_VIOLET"
+local PRESET_PALE_GREEN = "PRESET_PALE_GREEN"
+local PRESET_SEA_GREEN = "PRESET_SEA_GREEN"
+
+local clr_preset_mcm_list = {
+    { PRESET_NONE,       "d1sp_track_compatible_items_preset_none" },
+    { PRESET_SKY_BLUE,   "d1sp_track_compatible_items_preset_sky_blue" },
+    { PRESET_GOLD,       "d1sp_track_compatible_items_preset_gold" },
+    { PRESET_CRIMSON,    "d1sp_track_compatible_items_preset_crimson" },
+    { PRESET_WHITE,      "d1sp_track_compatible_items_preset_white" },
+    { PRESET_PEACH,      "d1sp_track_compatible_items_preset_peach" },
+    { PRESET_VIOLET,     "d1sp_track_compatible_items_preset_violet" },
+    { PRESET_PALE_GREEN, "d1sp_track_compatible_items_preset_pale_green" },
+    { PRESET_SEA_GREEN,  "d1sp_track_compatible_items_preset_sea_green" },
+}
+
+local clr_presets = {
+    [PRESET_SKY_BLUE] = GetARGB(50, 135, 206, 235),
+    [PRESET_GOLD] = GetARGB(50, 255, 215, 0),
+    [PRESET_CRIMSON] = GetARGB(50, 220, 20, 60),
+    [PRESET_WHITE] = GetARGB(50, 255, 255, 255),
+    [PRESET_PEACH] = GetARGB(50, 255, 218, 185),
+    [PRESET_VIOLET] = GetARGB(50, 238, 130, 238),
+    [PRESET_PALE_GREEN] = GetARGB(50, 152, 251, 152),
+    [PRESET_SEA_GREEN] = GetARGB(50, 32, 178, 170),
+}
+
+-- TODO: we could support separate colours per type, or separate colours per armour/weapon
+--       but for now we will just support allowing the main colour to be configurable and
+--       all compatible items will use this same colour
+local COMPAT_CLR = clr_presets[PRESET_GOLD] -- default
+
+-- TODO: We could add support for different colours per type
+local TYPE_UPGRADE = "upgrade"
+local TYPE_PART = "part"
+local TYPE_ATTACHMENT = "attachment"
+local TYPE_AMMO = "ammo"
+local TYPE_REPAIR = "repair"
+
+local KIND_UPGRADE = "i_upgrade"
+local KIND_PART = "i_part"
+local KIND_AMMO = "w_ammo"
+
+--[[
+    [kobra] is an [addon] and is marked as w_misc
+    as are other scopes
+
+    'i_attach' is actually for armour attachments so don't use that
+]]
+local KIND_ATTACHMENT = "w_misc"
+
+local KIND_REPAIR = "i_repair"
+
+local kind_type_map = {
+    [KIND_UPGRADE] = TYPE_UPGRADE,
+    [KIND_PART] = TYPE_PART,
+    [KIND_ATTACHMENT] = TYPE_ATTACHMENT,
+    [KIND_AMMO] = TYPE_AMMO,
+    [KIND_REPAIR] = TYPE_REPAIR,
+}
+
+local DEBUG = "debug"
+local INFO = "info"
+
+-- NOTE: debug logs will lag the game
+local enable_debug = false
+local enable_info = false
+
+local function print_dbg(type, func_name, fmt, ...)
+    if (type == DEBUG and enable_debug) or
+        (type == INFO and enable_info) then
+        printf(string.format("- [d1sp] [%s] [%s] | ", type, func_name) .. fmt, ...)
+    end
+end
+
+local function log_section_kind(type, func_name, msg, section, kind)
+    print_dbg(type, func_name, "'%s' - section: [%s] - kind: [%s]", msg, section, kind)
+end
+
+local function clear_table(table)
+    if not table then
+        return
+    end
+    for i = 1, #table do
+        table[i] = nil
+    end
+end
+
+local function flatten(tbl)
+    if tbl and type(tbl) == "table" then
+        return table.concat(tbl, ",")
+    else
+        return "<nil>"
+    end
+end
+
+--[[
+    Get a section or its parent section
+
+    This is required because items **can** change name/section if attachments are added
+
+    For example the ltx will have the following:
+
+    [wpn_ak74u]
+    parent_section                           = wpn_ak74u
+    [wpn_ak74u_kobra]:wpn_ak74u
+
+    where [wpn_ak74u_kobra] is just [wpn_ak74u] with a scope attached
+
+    The issue however stems from us needing to track a unique name for compatible items, and if we used
+    [wpn_ak74u_kobra] instead of [wpn_ak74u], then if someone removes the scope then the 'track item' menu
+    will become available as technically the base (parent) is not tracked
+    As such we *always* track against parent if available
+]]
+local function section_or_parent(obj)
+    if not obj then
+        return nil
+    end
+    local section = obj:section()
+    if not section then
+        return nil
+    end
+    local parent = ini_sys:r_string_ex(section, "parent_section") or "not_found"
+    if parent and parent ~= "not_found" then
+        section = parent
+    end
+    return section
+end
+
+local allowed_containers = {
+    "actor_equ",
+    "actor_belt",
+    "actor_bag",
+    "actor_trade_bag",
+    "actor_trade",
+    "npc_bag",
+    "npc_trade",
+    "npc_trade_bag"
+}
+
+local allowed_modes = {
+    "inventory",
+    "trade",
+    "loot"
+}
+
+local configured_types = {
+    [TYPE_UPGRADE] = true,
+    [TYPE_PART] = true,
+    [TYPE_ATTACHMENT] = true,
+    [TYPE_AMMO] = true,
+    [TYPE_REPAIR] = true
+}
+
+local tracked_bags = {
+    ["actor_bag"] = true,
+    ["actor_trade"] = true,
+    ["actor_trade_bag"] = true,
+    ["npc_bag"] = true,
+    ["npc_trade"] = true,
+    ["npc_trade_bag"] = true
+}
+
+local supported_kinds = {
+    [TYPE_UPGRADE] = {
+        ["w_sniper"] = true,
+        ["w_rifle"] = true,
+        ["w_smg"] = true,
+        ["w_shotgun"] = true,
+        ["w_pistol"] = true,
+        ["o_helmet"] = true,
+        ["o_heavy"] = true,
+        ["o_sci"] = true,
+        ["o_medium"] = true,
+        ["o_light"] = true
+    },
+    [TYPE_PART] = {
+        ["w_sniper"] = true,
+        ["w_rifle"] = true,
+        ["w_smg"] = true,
+        ["w_shotgun"] = true,
+        ["w_pistol"] = true,
+        ["o_helmet"] = true,
+        ["o_heavy"] = true,
+        ["o_sci"] = true,
+        ["o_medium"] = true,
+        ["o_light"] = true
+    },
+    [TYPE_ATTACHMENT] = {
+        ["w_sniper"] = true,
+        ["w_rifle"] = true,
+        ["w_smg"] = true,
+        ["w_shotgun"] = true,
+        ["w_pistol"] = true,
+    },
+    [TYPE_AMMO] = {
+        ["w_sniper"] = true,
+        ["w_rifle"] = true,
+        ["w_smg"] = true,
+        ["w_shotgun"] = true,
+        ["w_pistol"] = true
+    },
+    [TYPE_REPAIR] = {
+        ["w_sniper"] = true,
+        ["w_rifle"] = true,
+        ["w_smg"] = true,
+        ["w_shotgun"] = true,
+        ["w_pistol"] = true,
+        ["o_helmet"] = true,
+        ["o_heavy"] = true,
+        ["o_sci"] = true,
+        ["o_medium"] = true,
+        ["o_light"] = true
+    }
+}
+
+local function is_kind_supported(kind, type)
+    return supported_kinds[type][kind]
+end
+
+-- Whether we are tracking an item (gun or armour)
+-- format: [section_name] = true
+local tracked_items = {
+    [TYPE_UPGRADE] = {},
+    [TYPE_PART] = {},
+    [TYPE_ATTACHMENT] = {},
+    [TYPE_AMMO] = {},
+    [TYPE_REPAIR] = {}
+}
+
+-- A cache of compatible upgrades for each tracked item
+-- so we don't need to look them up each hover check
+-- format: [name] = { list of compatble upgrade names }
+local item_compatible_items_cache = {
+    [TYPE_UPGRADE] = {},
+    [TYPE_PART] = {},
+    [TYPE_ATTACHMENT] = {},
+    [TYPE_AMMO] = {},
+    [TYPE_REPAIR] = {}
+}
+
+-- tracks compatible items to items they are for so we can work backwards if needed
+-- format: [upgrade, part, attachment or ammo] = { "item1", "item2", etc }
+local inverse_compatible_item_to_item_tracker = {}
+
+-------------------------
+-- TRACKING UTILS
+-------------------------
+
+local function is_item_tracked(section_name, type)
+    if not section_name then
+        return
+    end
+    if not type then
+        return
+    end
+    return tracked_items[type][section_name]
+end
+
+local function can_obj_be_tracked(obj, type)
+    if not obj then
+        return false
+    end
+    local section = section_or_parent(obj)
+    if not section then
+        return false
+    end
+    local kind = SYS_GetParam(0, section, "kind", "not_found")
+    if not kind or kind == "not_found" then
+        return false
+    end
+    if not is_kind_supported(kind, type) then
+        log_section_kind(INFO, "can_obj_be_tracked", "invalid kind", section, kind)
+        return false
+    end
+    if is_item_tracked(section, type) then
+        log_section_kind(INFO, "can_obj_be_tracked", "obj already tracked", section, kind)
+        return false
+    end
+    log_section_kind(INFO, "can_obj_be_tracked", "obj can be tracked", section, kind)
+    return true
+end
+
+local function can_obj_be_untracked(obj, type)
+    if not obj then
+        return false
+    end
+    local section = section_or_parent(obj)
+    if not section then
+        return false
+    end
+    local kind = SYS_GetParam(0, section, "kind", "not_found")
+    if not kind or kind == "not_found" then
+        return false
+    end
+    if not is_kind_supported(kind, type) then
+        log_section_kind(INFO, "can_obj_be_tracked", "invalid kind", section, kind)
+        return false
+    end
+    if not is_item_tracked(section, type) then
+        log_section_kind(INFO, "can_obj_be_tracked", "obj isn't tracked", section, kind)
+        return false
+    end
+    log_section_kind(INFO, "can_obj_be_tracked", "obj can be untracked", section, kind)
+    return true
+end
+
+local function mark_tracked(section_name, type)
+    if not section_name then
+        return
+    end
+    print_dbg(INFO, "mark_tracked", "tracking item: [%s]", section_name)
+    tracked_items[type][section_name] = true
+end
+
+local function mark_untracked(section_name, type)
+    if not section_name then
+        return
+    end
+    print_dbg(INFO, "mark_tracked", "untracking item: [%s]", section_name)
+    tracked_items[type][section_name] = false
+end
+
+--[[
+    Get all the upgrades associated with the item
+
+    Returns format:
+    {
+        { "upg_1", ... },
+        { "upg_2", ...}
+    }
+]]
+local function get_item_upgrades(section_name)
+    local parse_sec = section_name
+    local section = section_name
+    local upgrades = nil
+    local parent = ini_sys:r_string_ex(section, "parent_section") or "not_found"
+    if parent and parent ~= "not_found" then
+        -- look for upgrades on parent
+        print_dbg(INFO, "get_item_upgrades", "found parent_section for gun: [%s]", section)
+        upgrades = SYS_GetParam(0, parent, "upgrades", "not_found")
+        parse_sec = parent
+    else
+        -- look for upgrades on this
+        upgrades = SYS_GetParam(0, section, "upgrades", "not_found")
+    end
+
+    if upgrades and upgrades ~= "" then
+        print_dbg(INFO, "get_item_upgrades", "found upgrades for tracked item: [%s] - [%s]", section, upgrades)
+        -- copied and modified from itms_manager --> ActorMenu_on_item_focus_receive [Upgrade parts]
+        local parsed_upgrades = parse_list(ini_sys, parse_sec, "upgrades")
+        print_dbg(INFO, "get_item_upgrades", "parsed upgrades: [%s]", flatten(parsed_upgrades))
+        local out_tbl = {}
+        for i = 1, #parsed_upgrades do
+            print_dbg(INFO, "get_item_upgrades", "extracting upgrade kits for: [%s]", parsed_upgrades[i])
+            itms_manager.extract_upgr_tools(out_tbl, parsed_upgrades[i])
+        end
+        local result = {}
+        for key, value in pairs(out_tbl) do
+            result[#result + 1] = key
+        end
+        print_dbg(INFO, "get_item_upgrades", "parsed upgrade kits: [%s]", flatten(result))
+        return result
+    else
+        print_dbg(INFO, "get_item_upgrades", "could not find an upgrades param for gun: [%s]", section)
+    end
+    return {}
+end
+
+local function get_item_parts(section_name)
+    local result = {}
+    local parent_sec = ini_sys:r_string_ex(section_name, "parent_section") or section_name
+    -- TODO: it may be better to load the ini_parts file in here instead
+    local parts_str = itms_manager.ini_parts:r_string_ex("con_parts_list", parent_sec)
+    local parts = parts_str and (parts_str ~= "") and str_explode(parts_str, ",")
+    if parts then
+        for i = 1, #parts do
+            print_dbg(INFO, "get_item_parts", "found part: [%s]", parts[i])
+            result[#result + 1] = parts[i]
+        end
+    end
+    return result
+end
+
+local function get_item_attachments(section_name)
+    -- NOTE: We can't have a dependency on 'obj' otherwise setting trackers onload wont work (as we don't have an obj)
+    --       as such we use the non-obj based versions of internal utils
+
+    -- NOTE: For future reference, in the ltx definition it appears some guns contain the parameter 'grenade_launcher_name'
+    --         while having the parameter 'grenade_launcher_status' == 0
+    --       I'm assuming this means the gun cannot have a grenade launcher equipped
+    --       But then why is it defined? As far as I can tell in the few cases I've tested
+    --         such guns don't always have the ability to add an underbarrel upgrade for the grenade launcher, vepr is an example of this
+    --       This means that we cannot check 'grenade_launcher_status' to highlight attachments as some guns will never work for attachment
+    --         tracking, like the AKMN. For now I've allowed the current logic of highlighting grenade launcher for the vepr (and others)
+    --         as its preferrable to certain guns not working at all.
+    --       The same appears to apply for silencers and scopes
+
+
+    local result = {}
+
+    local parent_sec = ini_sys:r_string_ex(section_name, "parent_section") or section_name
+
+    -- Scopes
+    local scopes = parse_list(ini_sys, parent_sec, "scopes")
+    for i = 1, #scopes do
+        result[#result + 1] = scopes[i]
+    end
+
+    local scope = utils_item.get_wpn_param(nil, section_name, "scopes_sect") -- NOTE: can pass nil instead of obj and it will use the section
+    if scope then                                                            -- and (obj:weapon_scope_status() == 2) then
+        result[#result + 1] = scope
+    end
+
+    -- Silencer
+    local sil = utils_item.get_wpn_param(nil, section_name, "silencer_name")
+    if sil then -- and (obj:weapon_silencer_status() == 2) then
+        result[#result + 1] = sil
+    end
+
+    -- Grenade Launcher
+    local gl = utils_item.get_wpn_param(nil, section_name, "grenade_launcher_name")
+    if gl then -- and (obj:weapon_grenadelauncher_status() == 2) then
+        result[#result + 1] = gl
+    end
+
+    print_dbg(INFO, "get_item_attachments", "attachments: [%s]", flatten(result))
+
+    return result
+end
+
+local function get_item_ammo(section_name)         --, obj)
+    local result = {}
+    local ammo = utils_item.get_ammo(section_name) -- , obj:id()) -- doens't appear to be required by func
+    for i = 1, #ammo do
+        result[#result + 1] = ammo[i]
+    end
+    return result
+end
+
+local function get_repair_kits(section_name)
+    if not section_name then
+        return {}
+    end
+
+    local result = {}
+    local parent_sec = ini_sys:r_string_ex(section_name, "parent_section") or section_name
+    -- Repair kits
+    local repair_type = ini_sys:r_string_ex(parent_sec, "repair_type")
+    if repair_type and repair_type ~= "" then
+        local repairs = GetItemList("repair")
+        if repairs then
+            for kit, v in pairs(repairs) do
+                if kit and v and v[repair_type] then
+                    result[#result + 1] = kit
+                end
+            end
+        end
+        -- Copied from source - may be useful in next version ?
+        --[[
+        for kit,v in pairs(GetItemList("workshop")) do
+            if v[repair_type] then
+                focus_tbl[#focus_tbl + 1] = kit
+            end
+        end
+        --]]
+    end
+
+    return result
+end
+
+--[[
+    Clear the upgrade cache for the given item
+]]
+local function clear_items_upgrade_cache(section_name, type)
+    if not section_name then
+        return
+    end
+    print_dbg(INFO, "clear_items_upgrade_cache", "item: [%s] type: [%s] - cache: [%s]", section_name, type,
+        flatten(item_compatible_items_cache[type][section_name]))
+    local cache = item_compatible_items_cache[type][section_name]
+    if cache then
+        if #cache > 0 then
+            clear_table(item_compatible_items_cache[type][section_name])
+            print_dbg(INFO, "clear_items_upgrade_cache", "upgrade cache for: [%s] has been cleared", section_name)
+        else
+            print_dbg(INFO, "clear_items_upgrade_cache", "upgrade cache for: [%s] was empty", section_name)
+        end
+    else
+        item_compatible_items_cache[type][section_name] = {}
+        print_dbg(INFO, "clear_items_upgrade_cache", "no cache found for item: [%s] - new cache created",
+            section_name)
+    end
+end
+
+--[[
+    Refresh the upgrade cache for the given item
+
+    section_name = the name of the item
+]]
+local function refresh_item_upgrade_cache(section_name, type, obj)
+    -- NOTE: obj will be <nil> on first load
+    --       i was previously passing this variables into the internal funcs for getting compatible
+    --       items, but they appear to work without it
+
+    print_dbg(INFO, "refresh_item_upgrade_cache", "item: [%s] type: [%s]", section_name, type)
+
+    if not section_name or not type then
+        return
+    end
+
+    clear_items_upgrade_cache(section_name, type)
+
+    local items = nil
+
+    if type == TYPE_UPGRADE then
+        items = get_item_upgrades(section_name)
+    elseif type == TYPE_PART then
+        items = get_item_parts(section_name)
+    elseif type == TYPE_ATTACHMENT then
+        items = get_item_attachments(section_name)
+    elseif type == TYPE_AMMO then
+        items = get_item_ammo(section_name)
+    elseif type == TYPE_REPAIR then
+        items = get_repair_kits(section_name)
+    end
+
+    if items and #items > 0 then
+        print_dbg(INFO, "refresh_item_upgrade_cache", "loaded items: [%s] for section: [%s] and type: [%s]",
+            flatten(items),
+            section_name, type)
+
+        local cached_upg = item_compatible_items_cache[type][section_name]
+        if not cached_upg then
+            print_dbg(INFO, "refresh_item_upgrade_cache", "no cache found for item: [%s] - new cache created",
+                section_name)
+            item_compatible_items_cache[type][section_name] = {}
+        end
+
+        for i = 1, #items do
+            print_dbg(INFO, "refresh_item_upgrade_cache", "caching item: [%s] against item: [%s]", items[i],
+                section_name)
+            item_compatible_items_cache[type][section_name][#cached_upg + 1] = items[i]
+        end
+    end
+
+    return items
+end
+
+--[[
+    Track an item against a compatible item (this helps us look it up easier later)
+
+    These are not separated by 'type', the table is just one long list of:
+    ["compatible item"] = { items that use it }
+]]
+local function inverse_track_item_against_compatible_item(compatible_item_name, item_name)
+    if not compatible_item_name or not item_name then
+        return
+    end
+    print_dbg(INFO, "inverse_track_item_against_compatible_item",
+        "attempting to track item: [%s] against compatible item: [%s]",
+        item_name,
+        compatible_item_name)
+
+    if not inverse_compatible_item_to_item_tracker[compatible_item_name] then
+        inverse_compatible_item_to_item_tracker[compatible_item_name] = {}
+    end
+
+    local items = inverse_compatible_item_to_item_tracker[compatible_item_name]
+    local matched = false
+    for i = 1, #items do
+        local item = items[i]
+        if item == item_name then
+            matched = true
+            break
+        end
+    end
+    if not matched then
+        print_dbg(INFO, "track_item_for_upgrade", "item: [%s] for item: [%s] - tracked", item_name,
+            compatible_item_name)
+        items[#items + 1] = item_name
+    else
+        print_dbg(
+            INFO,
+            "track_item_for_upgrade", "item: [%s] for item: [%s] - tracking skipped - item already tracked",
+            item_name, compatible_item_name)
+    end
+end
+
+local function inverse_untrack_item_from_compatible_item(compatible_item_name, item_name)
+    if not compatible_item_name or not item_name then
+        return
+    end
+    if not inverse_compatible_item_to_item_tracker[compatible_item_name] then
+        inverse_compatible_item_to_item_tracker[compatible_item_name] = {}
+        return
+    end
+
+    local items = inverse_compatible_item_to_item_tracker[compatible_item_name]
+
+    local indx = nil -- the indx of the item to remove
+    for i = 1, #items do
+        local item = items[i]
+        if item == item_name then
+            indx = i
+            break
+        end
+    end
+    if indx then
+        -- NOTE: changes the index of other items as it shifts down
+        table.remove(items, indx)
+        print_dbg(INFO, "inverse_untrack_item_from_compatible_item", "item: [%s] for item: [%s] - untracked",
+            item_name,
+            compatible_item_name)
+    else
+        print_dbg(INFO,
+            "inverse_untrack_item_from_compatible_item",
+            "item: [%s] for item: [%s] - untracking skipped - not currently tracked",
+            item_name, compatible_item_name)
+    end
+end
+
+--[[
+    Start tracking upgrades for a gun or armour
+]]
+local function track_item(section_name, type, obj)
+    if not obj then
+        print_dbg(INFO, "track_item", "may not be able cannot track item. obj is <nil>. this happens on first load")
+        -- don't return - upgrades and parts don't need obj
+    end
+
+    if is_item_tracked(section_name, type) then
+        print_dbg(INFO, "track_item", "item already tracked: [%s] type: [%s]", section_name)
+        return
+    end
+
+    -- (1) refresh cache
+    local compatible_items = refresh_item_upgrade_cache(section_name, type, obj)
+
+    print_dbg(INFO, "track_item", "found compatible items: [%s]", flatten(compatible_items))
+
+    -- (2) setup a upgrade tracker as well for quick clearing
+    if compatible_items and #compatible_items > 0 then
+        for i = 1, #compatible_items do
+            inverse_track_item_against_compatible_item(compatible_items[i], section_name)
+        end
+    end
+
+    -- (3) finally set the tracker
+    mark_tracked(section_name, type)
+
+    print_dbg(INFO, "track_item", "item: [%s] should now be tracked!", section_name)
+end
+
+--[[
+    Stop tracking upgrades for a gun or armour
+]]
+local function untrack_item(section_name, type, obj)
+    if not is_item_tracked(section_name, type) then
+        print_dbg(INFO, "untrack_item", "item is not tracked: [%s]", section_name)
+        return
+    end
+
+    -- (1) clear its cache
+    clear_items_upgrade_cache(section_name, type)
+
+    -- (2) remove it from the upgrade tracker
+    local compatible_items = nil
+    if type == TYPE_UPGRADE then
+        compatible_items = get_item_upgrades(section_name)
+    elseif type == TYPE_PART then
+        compatible_items = get_item_parts(section_name)
+    elseif type == TYPE_ATTACHMENT and itms_manager.IsWeapon(obj) then
+        compatible_items = get_item_attachments(section_name)
+    elseif type == TYPE_AMMO and itms_manager.IsWeapon(obj) then
+        compatible_items = get_item_ammo(section_name) -- , obj)
+    elseif type == TYPE_REPAIR then
+        compatible_items = get_repair_kits(section_name)
+    end
+
+    if compatible_items and #compatible_items > 0 then
+        for i = 1, #compatible_items do
+            inverse_untrack_item_from_compatible_item(compatible_items[i], section_name)
+        end
+    end
+
+    -- (3) finally untrack it
+    mark_untracked(section_name, type)
+
+    print_dbg(INFO, "untrack_item", "item: [%s] should now be untracked!", section_name)
+end
+
+local function obj_can_be_cleared(obj, type)
+    if not obj or not type then
+        return false
+    end
+    local section = section_or_parent(obj)
+    if not section then
+        return false
+    end
+    local kind = SYS_GetParam(0, section, "kind", "not_found")
+    if kind ~= "not_found" and is_kind_supported(kind, type) then
+        return false
+    end
+    return inverse_compatible_item_to_item_tracker[section] and #(inverse_compatible_item_to_item_tracker[section]) > 0
+end
+
+-- export funcs - YM
+    -- get functions -- just get a copy of the func/list
+    -- return list {}
+function get_inverse_compatible_item_to_item_tracker ()
+    return inverse_compatible_item_to_item_tracker or {}
+end
+
+    -- check functions -- do a single check of key against list
+    -- list[key]
+    -- return boolean
+function check_inverse_compatible_item_to_item_tracker(compatible_item)
+    return inverse_compatible_item_to_item_tracker[compatible_item] or false
+end
+
+function check_get_item_parts(section_name)
+    return get_item_parts(section_name) or {}
+end
+
+
+function check_is_kind_supported(kind, type)
+    return is_kind_supported(kind, type) or false
+end
+
+function check_is_item_tracked(section_name, type)
+    return is_item_tracked(section_name, type) or false
+end
+
+
+-------------------------
+-- PATCHES
+-------------------------
+
+local original_UICellItem_Highlight = utils_ui.UICellItem.Highlight
+function utils_ui.UICellItem:Highlight(state, clr_id, main_clr)
+    if state and (not self:IsShown()) and (not self.manual) then
+        return
+    end
+
+    local highlighted = false
+    local section = self.section
+    local parent_section = nil
+    if section then
+        -- TODO: required due to attachment changing name of item
+        local parent = ini_sys:r_string_ex(section, "parent_section") or "not_found"
+        if parent and parent ~= "not_found" then
+            parent_section = parent
+        end
+        local kind = SYS_GetParam(0, section, "kind", "not_found")
+        local type = nil
+        local sect = parent_section or section
+
+        if kind and kind ~= "not_found" then
+            type = kind_type_map[kind]
+        end
+
+        print_dbg(DEBUG, "utils_ui.UICellItem.Highlight", "type: [%s] kind: [%s] section: [%s]", type, kind, sect)
+
+        if tracked_bags[self.container.ID] then
+            if type and (type == TYPE_UPGRADE or type == TYPE_PART or type == TYPE_ATTACHMENT or type == TYPE_AMMO or type == TYPE_REPAIR) then
+                print_dbg(DEBUG, "utils_ui.UICellItem.Highlight",
+                    "attempting to highlight - type: [%s] kind: [%s] section: [%s]", type, kind, sect)
+
+                local cache = inverse_compatible_item_to_item_tracker[sect]
+                if not cache or #cache == 0 then
+                    print_dbg(DEBUG, "utils_ui.UICellItem.Highlight", "compatible item: [%s] is not tracked - skipping",
+                        sect)
+                else
+                    print_dbg(DEBUG, "utils_ui.UICellItem.Highlight",
+                        "compatible item: [%s] is tracked - items in cache: [%s]",
+                        sect,
+                        #cache)
+
+                    for i = 1, #cache do
+                        local item = cache[i]
+                        if tracked_items[type][item] then
+                            print_dbg(
+                                DEBUG,
+                                "utils_ui.UICellItem.Highlight",
+                                "highlighting item: [%s] from item: [%s] being tracked",
+                                sect,
+                                item)
+
+                            highlighted = true
+                            self.hl:Show(true)
+                            self.hl:SetTextureColor(COMPAT_CLR)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if not highlighted then
+        original_UICellItem_Highlight(self, state, clr_id, main_clr)
+    end
+end
+
+-------------------------
+-- RIGHT CLICK MENU ITEMS
+-------------------------
+
+local function translate(key)
+    print_dbg(INFO, "translate", "key: [%s]", key or "<nil>")
+    if not key then
+        return "<localization-not-found>"
+    end
+    return game.translate_string(key)
+end
+
+-- track
+
+function ui_inventory.UIInventory:D1sp_Track_Name(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Track_Name", "type: [%s]", type)
+    if type == TYPE_UPGRADE then
+        return translate("d1sp_track_compatible_items_track_upgrade_kits")
+    elseif type == TYPE_PART then
+        return translate("d1sp_track_compatible_items_track_parts")
+    elseif type == TYPE_ATTACHMENT then
+        return translate("d1sp_track_compatible_items_track_attachments")
+    elseif type == TYPE_AMMO then
+        return translate("d1sp_track_compatible_items_track_ammo")
+    elseif type == TYPE_REPAIR then
+        return translate("d1sp_track_compatible_items_track_repair_tools")
+    end
+    return "<not-found>"
+end
+
+function ui_inventory.UIInventory:D1sp_Track_Cond(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Track_Cond", "type: [%s]", type)
+    obj = self:CheckItem(obj, "D1sp_Track_Cond")
+    if not obj then
+        return
+    end
+    return can_obj_be_tracked(obj, type)
+end
+
+function ui_inventory.UIInventory:D1sp_Track_Action(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Track_Action", "type: [%s]", type)
+    obj = self:CheckItem(obj, "D1sp_Track_Action")
+    if not obj then
+        return
+    end
+    if can_obj_be_tracked(obj, type) then
+        local section = section_or_parent(obj)
+        if section then
+            track_item(section, type, obj)
+        end
+    end
+end
+
+-- untrack
+
+function ui_inventory.UIInventory:D1sp_Untrack_Name(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Untrack_Name", "type: [%s]", type)
+    if type == TYPE_UPGRADE then
+        return translate("d1sp_track_compatible_items_untrack_upgrade_kits")
+    elseif type == TYPE_PART then
+        return translate("d1sp_track_compatible_items_untrack_parts")
+    elseif type == TYPE_ATTACHMENT then
+        return translate("d1sp_track_compatible_items_untrack_attachments")
+    elseif type == TYPE_AMMO then
+        return translate("d1sp_track_compatible_items_untrack_ammo")
+    elseif type == TYPE_REPAIR then
+        return translate("d1sp_track_compatible_items_untrack_repair_tools")
+    end
+    return "<not-found>"
+end
+
+function ui_inventory.UIInventory:D1sp_Untrack_Cond(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Untrack_Cond", "type: [%s]", type)
+    obj = self:CheckItem(obj, "D1sp_Untrack_Cond")
+    if not obj then
+        return
+    end
+    return can_obj_be_untracked(obj, type)
+end
+
+function ui_inventory.UIInventory:D1sp_Untrack_Action(obj, bag, temp, type)
+    print_dbg(INFO, "D1sp_Untrack_Action", "type: [%s]", type)
+    obj = self:CheckItem(obj, "D1sp_Untrack_Action")
+    if not obj then
+        return
+    end
+    if can_obj_be_untracked(obj, type) then
+        local section = section_or_parent(obj)
+        if section then
+            untrack_item(section, type, obj)
+        end
+    end
+end
+
+-- clear all trackers
+
+function ui_inventory.UIInventory:D1sp_Clear_Upgrade_Trackers_Name(obj, bag, temp)
+    print_dbg(INFO, "D1sp_Clear_Upgrade_Trackers_Name", "")
+    return translate("d1sp_track_compatible_items_clear_trackers")
+end
+
+function ui_inventory.UIInventory:D1sp_Clear_Upgrade_Trackers_Cond(obj, bag, temp)
+    print_dbg(INFO, "D1sp_Clear_Upgrade_Trackers_Cond", "")
+    obj = self:CheckItem(obj, "D1sp_Clear_Upgrade_Trackers_Cond")
+    if not obj then
+        return
+    end
+    local section = section_or_parent(obj)
+    if not section then
+        return
+    end
+    local kind = SYS_GetParam(0, section, "kind", "not_found")
+    if not kind or kind == "not_found" then
+        return
+    end
+    local type = kind_type_map[kind]
+    return type and obj_can_be_cleared(obj, type)
+end
+
+function ui_inventory.UIInventory:D1sp_Clear_Upgrade_Trackers_Action(obj, bag, temp)
+    print_dbg(INFO, "D1sp_Clear_Upgrade_Trackers_Action", "")
+    obj = self:CheckItem(obj, "D1sp_Clear_Upgrade_Trackers_Cond")
+    if not obj then
+        return
+    end
+    local section = section_or_parent(obj)
+    if not section then
+        return
+    end
+    local kind = SYS_GetParam(0, section, "kind", "not_found")
+    if not kind or kind == "not_found" then
+        return
+    end
+    local type = kind_type_map[kind]
+    if type and obj_can_be_cleared(obj, type) then
+        local items = inverse_compatible_item_to_item_tracker[section]
+        if type and items and #items > 0 then
+            local tmp = dup_table(items)
+            print_dbg(INFO, "clearing items: [%s] for compatible item: [%s]", flatten(tmp), section)
+            for i = 1, #tmp do
+                -- NOTE: calling into this modifies the table 'items'
+                --       thats why we make a copy
+                untrack_item(tmp[i], type, obj)
+            end
+        end
+    end
+end
+
+-------------------------
+-- GAME SAVE
+-------------------------
+
+-- NOTE: mod renamed to 'track compatible items' from v0.0.1 to v0.0.2
+--       key format was retained and 'd1sp_track_compatible_item_upgrades_data_v1'
+--       is taken from the old version for backwards compatibility reasons
+--
+-- versionned incase we want to change format
+local DATA_KEY_UPGRADES_V1 = "d1sp_track_compatible_item_upgrades_data_v1";
+local DATA_KEY_PARTS_V1 = "d1sp_track_compatible_item_parts_data_v1";
+local DATA_KEY_ATTACHMENTS_V1 = "d1sp_track_compatible_item_attachments_data_v1";
+local DATA_KEY_AMMO_V1 = "d1sp_track_compatible_item_ammo_data_v1";
+local DATA_KEY_REPAIR_V1 = "d1sp_track_compatible_item_repair_tools_data_v1";
+
+local data_keys = {
+    [TYPE_UPGRADE] = DATA_KEY_UPGRADES_V1,
+    [TYPE_PART] = DATA_KEY_PARTS_V1,
+    [TYPE_ATTACHMENT] = DATA_KEY_ATTACHMENTS_V1,
+    [TYPE_AMMO] = DATA_KEY_AMMO_V1,
+    [TYPE_REPAIR] = DATA_KEY_REPAIR_V1
+}
+
+local function handle_save_state(mdata)
+    if not mdata then
+        return
+    end
+
+    -- NOTE: separate so we can 'clean up' the trackers and cache on each load
+    print_dbg(INFO, "handle_save_state", "saving ...")
+
+    for type, enabled in pairs(configured_types) do
+        local key = data_keys[type]
+        if key and enabled then
+            local items = {}
+            for item_name, is_tracked in pairs(tracked_items[type]) do
+                if is_tracked then
+                    print_dbg(INFO, "handle_save_state", "saving tracker for item: [%s] and type: [%s]", item_name, type)
+                    items[#items + 1] = item_name
+                end
+            end
+            mdata[key] = items or {}
+        end
+    end
+
+    -- Don't save the cache. This way we can fix issues with new items
+    -- being added without doing anything.
+
+    print_dbg(INFO, "handle_save_state", "saved!")
+end
+
+local function handle_load_state(mdata)
+    if not mdata then
+        return
+    end
+
+    -- TODO: What happens if someone tracks a gun/armour from a mod and then removes it?
+    --       We could add a 'reset on load' option to MCM that can be ticked and
+    --         will reset all tracking
+    print_dbg(INFO, "handle_load_state", "loading ...")
+
+    for type, enabled in pairs(configured_types) do
+        local key = data_keys[type]
+        if key and enabled then
+            local data = mdata[key]
+            if data then
+                print_dbg(INFO, "handle_load_state", "found save data for key: [%s] type: [%s] data: [%s]", key, type,
+                    flatten(data))
+                for i = 1, #data do
+                    local item = data[i]
+                    print_dbg(INFO, "handle_load_state", "loading tracker for item: [%s] and type: [%s]", item, type)
+                    track_item(item, type)
+                end
+            end
+        end
+    end
+
+    print_dbg(INFO, "handle_save_state", "loaded!")
+end
+
+-------------------------
+-- CALLBACKS
+-------------------------
+
+local initialized = false
+
+local function get_properties_index(gui)
+    -- For some reason setting the index of new items via #(gui.properties) + 1
+    -- doesn't set the correct index
+    -- instead we iterate the menu items and manually find the highest index and
+    -- use that + 1
+    local i = 1
+    for key, tbl in pairs(gui.properties) do
+        print_dbg(DEBUG, "get_properties_index", "found menu item: [%s] index: [%s]", key, i)
+        i = math.max(i, tbl.index)
+    end
+    print_dbg(DEBUG, "get_properties_index", "found max index: %s", i)
+    return i + 1
+end
+
+local function handle_GUI_on_show()
+    if not initialized then
+        print_dbg(INFO, "handle_GUI_on_show", "initializing menu items")
+
+        local gui = GetActorMenu()
+
+        -- Options for menu items:
+        -- key --> value
+        -- key is an ID for the menu item (not its display name)
+        -- value is a table of:
+        -- {
+        --     [1] ["index"] = its index in the list (number)
+        --     [2] ["name"] = the lookup key of the name
+        --         or ["name_func"] = name of UIInventory member function to get above
+        --     [3] ["mode"] = a table of modes the option is available in
+        --                    {"inventory","loot","trade"}
+        --         or ["mode_func"] = name of UIInventory member function to get above
+        --     [4] ["cont"] = a table of containers its available in
+        --                    {"actor_equ","actor_belt"}
+        --         or ["cont_func"] = name of UIInventory member function to get above
+        --     [5] ["precondition"] = condition for it to show
+        --     [6] ["action"] = function to call on clicking it
+        -- }
+
+        print_dbg(INFO, "handle_GUI_on_show", "configuring new menu items")
+
+        for type, enabled in pairs(configured_types) do
+            if enabled then
+                -- t2k_table appears to convert a table list { keys } into { key = true }
+                gui.properties["d1sp_trk_compat_itms_track" .. "_" .. type] = {
+                    index = get_properties_index(gui),
+                    name_func = { "D1sp_Track_Name", type },
+                    mode = t2k_table(dup_table(allowed_modes)),
+                    cont = t2k_table(dup_table(allowed_containers)),
+                    precondition1 = { "D1sp_Track_Cond", type },
+                    action = { "D1sp_Track_Action", type }
+                }
+                gui.properties["d1sp_trk_compat_itms_untrack" .. "_" .. type] = {
+                    index = get_properties_index(gui),
+                    name_func = { "D1sp_Untrack_Name", type },
+                    mode = t2k_table(dup_table(allowed_modes)),
+                    cont = t2k_table(dup_table(allowed_containers)),
+                    precondition1 = { "D1sp_Untrack_Cond", type },
+                    action = { "D1sp_Untrack_Action", type }
+                }
+                print_dbg(INFO, "handle_GUI_on_show", "initialized menu items for type: [%s]", type)
+            end
+        end
+
+        gui.properties["d1sp_trk_compat_itms_track_clear"] = {
+            index = get_properties_index(gui),
+            name_func = { "D1sp_Clear_Upgrade_Trackers_Name", type },
+            mode = t2k_table(dup_table(allowed_modes)),
+            cont = t2k_table(dup_table(allowed_containers)),
+            precondition1 = { "D1sp_Clear_Upgrade_Trackers_Cond", type },
+            action = { "D1sp_Clear_Upgrade_Trackers_Action", type }
+        }
+
+        print_dbg(INFO, "handle_GUI_on_show", "menu items initialized")
+
+        initialized = true
+    end
+end
+
+-------------------------
+-- INIT
+-------------------------
+
+function on_game_start()
+    RegisterScriptCallback("GUI_on_show", handle_GUI_on_show)
+    RegisterScriptCallback("load_state", handle_load_state)
+    RegisterScriptCallback("save_state", handle_save_state)
+
+    -- mcm
+    load_settings()
+    RegisterScriptCallback("on_option_change", handle_on_option_change)
+end
+
+-------------------------
+-- MCM
+-------------------------
+
+local mod_name = "d1sp_track_compatible_items"
+
+local function read_settings()
+    local mcm = ui_mcm
+    if mcm then
+        -- GOLD
+        COMPAT_CLR = GetARGB(
+            50,
+            mcm.get(mod_name .. "/common_clr_red") or 255,
+            mcm.get(mod_name .. "/common_clr_green") or 215,
+            mcm.get(mod_name .. "/common_clr_blue") or 0)
+
+        local common_clr_preset = mcm.get(mod_name .. "/common_clr_preset")
+        if common_clr_preset and common_clr_preset ~= PRESET_NONE then
+            local preset = clr_presets[common_clr_preset]
+            if preset then
+                COMPAT_CLR = preset
+            end
+        end
+    end
+end
+
+function load_settings()
+    read_settings()
+end
+
+function handle_on_option_change(state)
+    if state then
+        read_settings()
+    end
+end
+
+function on_mcm_load()
+    local options_tree = {
+        -- NOTE: [val] determines how the value is casted - 0=string, 1=bool, 2=number/float
+        id = mod_name,
+        text = "ui_mcm_d1sp_track_compatible_items_tab_title",
+        sh = true,
+        gr = {
+            {
+                id = "banner",
+                type = "slide",
+                text = "ui_mcm_d1sp_track_compatible_items_banner",
+                size = { 512, 50 },
+                spacing = 20
+            },
+            -- Preset desc
+            {
+                id = "preset_desc",
+                type = "desc",
+                clr = { 200, 200, 255, 200 },
+                text = "ui_mcm_d1sp_track_compatible_items_common_clr_preset_desc"
+            },
+            -- common colour preset
+            {
+                id = "common_clr_preset",
+                type = "list",
+                val = 0,
+                def = PRESET_NONE,
+                content = clr_preset_mcm_list
+            },
+            { id = "divider", type = "line" },
+            -- common colour config
+            {
+                id = "common_clr_desc",
+                type = "desc",
+                clr = { 200, 200, 255, 200 },
+                text = "ui_mcm_d1sp_track_compatible_items_common_clr_desc"
+            },
+            {
+                id = "common_clr_red",
+                text = "ui_mcm_d1sp_track_compatible_items_common_clr_red",
+                type = "track",
+                val = 2,
+                min = 0,
+                max = 255,
+                step = 1,
+                def = 220
+            },
+            {
+                id = "common_clr_green",
+                text = "ui_mcm_d1sp_track_compatible_items_common_clr_green",
+                type = "track",
+                val = 2,
+                min = 0,
+                max = 255,
+                step = 1,
+                def = 20
+            },
+            {
+                id = "common_clr_blue",
+                text = "ui_mcm_d1sp_track_compatible_items_common_clr_blue",
+                type = "track",
+                val = 2,
+                min = 0,
+                max = 255,
+                step = 1,
+                def = 60
+            }
+        }
+    }
+    return options_tree
+end

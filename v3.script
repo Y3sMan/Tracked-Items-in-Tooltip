@@ -1,0 +1,275 @@
+--#region debug
+-- MCM option to enable per mod debugging
+local DEBUG = true
+
+local function dbg_print(msg,...)
+	if not ym_debug then return end
+
+	ym_debug.set_modname("Tracked Items in Tooltip")
+	ym_debug.dbg_print(msg,...)
+end
+
+local function dbg_dump(o)
+	if not ym_debug then return end
+
+	return ym_debug.dbg_dump(o)
+end
+
+local function newline()
+	if not ym_debug then return end
+	ym_debug.dbg_newline()
+end
+--#endregion
+
+
+
+local gc = game.translate_string
+
+local first_update = true
+
+local try = try or function(func, ...)
+	local status, error_or_result = pcall(func, ...)
+	if not status then
+		printf(error_or_result)
+		return false, status, error_or_result
+	else
+		return error_or_result, status
+	end
+end
+
+local XMLP
+local sync_cursor           = utils_xml.sync_cursor
+
+local get_inverse_compatible_item_to_item_tracker = d1sp_track_compatible_items_mcm.get_inverse_compatible_item_to_item_tracker
+
+Base_UIInfoItem_Init = nil
+
+-- function YM_UIInfoItem_Init(sender, owner, delay)
+
+og_info_item_init = utils_ui.UIInfoItem.__init
+utils_ui.UIInfoItem.__init = function(self, owner, delay)
+	og_info_item_init(self, owner, delay)
+
+	sender.xml = sender.xml or (function()
+		if not XMLP then
+			XMLP = CScriptXmlInit()
+			XMLP:ParseFile("utils.xml")
+		end
+		return XMLP
+	end)()
+
+	first_update = true
+	self.CC = self.CC or {}
+
+	self.cont_to_str = {
+		tracked = "st_tracked_for",
+	}
+	
+	--Recipes
+	self.tracked_items          = self.xml:InitStatic("item_info:ammo_type", self.dialog)
+	self.tracked_items_txt      = self.xml:InitTextWnd("item_info:ammo_type:cap_ammo_used_type", self.dialog)
+end
+
+utils_ui.UIInfoItem.AddTrackedPartsContainer = function(self, offset, tbl, cont)
+	if not self.cont_to_str[cont] then return end
+
+	local xml = self.xml
+	self[cont] = xml:InitStatic("item_info:ammo_type", self.dialog)
+
+	local size = {
+		x = self.frame:GetWidth(),
+		y = self.frame:GetHeight(),
+	}
+	local pos = self[cont]:GetWndPos()
+	local size_recipes = {
+		x = self[cont]:GetWidth(),
+		y = self[cont]:GetHeight(),
+	}
+
+	local new_size = {
+		x = size.x - pos.x * 2 - 32, -- MINUS HERE to prevet icons to go out the right side of the tooltip
+		y = size_recipes.y
+	}
+
+	self[cont]:SetWndSize(vector2():set(new_size.x, new_size.y))
+
+	self.CC[cont] = utils_ui.UICellContainer("item_info_tracked_parts_container", self, nil, "item_info:ammo_type:static_ammo_type1", self[cont])
+	self.CC[cont].showcase      		= true
+	self.CC[cont].can_select	   		= false
+	self.CC[cont].disable_bar         = true
+	self.CC[cont].disable_drag  		= true
+	self.CC[cont].disable_highlight   = true
+	self.CC[cont].disable_info        = true
+	self.CC[cont].disable_scroll      = true
+	self.CC[cont].disable_scroll_dragdrop = true
+	self.CC[cont].disable_stack	     = true
+	self.CC[cont]:EnableScrolling(false)
+
+	self.CC[cont].prof:SetWndSize(vector2():set(new_size.x, new_size.y))
+	utils_xml.sync_size(self.CC[cont].prof, self[cont], 0, offset)
+	utils_xml.sync_size(self.CC[cont].prof , self.CC[cont].scroll)
+	self.CC[cont]:SetGridSpecs(35, 5)
+
+	self.CC[cont]:Reinit(tbl)
+	self.CC[cont]:AdjustHeightToCell()	
+
+	utils_xml.sync_size(self.CC[cont].prof, self[cont], 0, offset)
+	self[cont]:SetAutoDelete(true)
+	self:SyncTrackedPartsText(false, cont)	
+end
+
+utils_ui.UIInfoItem.MoveTrackedItemsRightVertical = function(self, offset, tbl, cont)
+	if not self.cont_to_str[cont] then return end
+
+	local frame_size = {x = self.frame:GetWidth(), y = self.frame:GetHeight()}
+	local recipes_pos = self[cont]:GetWndPos()
+	local recipes_size = {x = self[cont]:GetWidth(), y = self[cont]:GetHeight()}
+	local stats_dialog_pos = self.stats_dialog:GetWndPos()
+	
+	local new_pos = {
+		x = frame_size.x - stats_dialog_pos.x - 125,
+		y = stats_dialog_pos.y
+	}
+
+	local new_size = {
+		x = 100,
+		y = frame_size.y
+	}
+
+	self[cont]:SetWndPos(vector2():set(new_pos.x, new_pos.y))
+	self[cont]:SetWndSize(vector2():set(new_size.x, new_size.y))
+	self.CC[cont].prof:SetWndSize(vector2():set(new_size.x, new_size.y))
+	utils_xml.sync_size(self.CC[cont].prof, self[cont], 0, offset)
+	utils_xml.sync_size(self.CC[cont].prof , self.CC[cont].scroll)
+	self.CC[cont]:SetGridSpecs(35, 5)
+
+	self.CC[cont]:Reinit(tbl)
+	self.CC[cont]:AdjustHeightToCell()	
+	self.CC[cont]:AdjustWidthToCell()	
+
+	utils_xml.sync_size(self[cont] , self.CC[cont].scroll)
+
+	self:SyncTrackedPartsText(true, cont)
+end
+
+function sanitizeText(str)
+	return trim(str:gsub("%%c%[.-%]", ""))
+end
+
+utils_ui.UIInfoItem.SyncTrackedPartsText = function(self, vertical, cont, text)
+	if not self.cont_to_str[cont] then return end
+
+	local str = text and gc(text) or gc(self.cont_to_str[cont])
+	str = sanitizeText(str)
+	local pos = self[cont]:GetWndPos()
+	self[cont.."_txt"]:SetText(str)
+	self[cont.."_txt"]:Show(true)
+	if vertical then
+		local tracked_parts_txt_pos = self.stats_dialog:GetWndPos()
+		self[cont.."_txt"]:SetWndPos(vector2():set(pos.x, tracked_parts_txt_pos.y))
+		self[cont.."_txt"]:SetWndSize(vector2():set(self.frame:GetWidth() - pos.x - 16, self.ammo_cap:GetHeight()))
+		self[cont.."_txt"]:SetTextAlignment(2)
+	else
+		local tracked_parts_txt_pos = self.desc:GetWndPos()
+		self[cont.."_txt"]:SetWndSize(vector2():set(self.desc:GetWidth(), self.desc:GetHeight()))
+		self[cont.."_txt"]:SetWndPos(vector2():set(tracked_parts_txt_pos.x, pos.y))
+		self[cont.."_txt"]:SetTextAlignment(0)
+	end
+end
+
+
+utils_ui.UIInfoItem.RemoveTrackedItemsContainer = function(self, cont)
+	self[cont]:Show(false)
+	self.CC[cont] = nil
+	self[cont.."_txt"]:Show(false)
+end
+
+Base_UIInfoItem_Update = nil
+function YM_UIInfoItem_Update(sender, obj, sec, flags)
+    Base_UIInfoItem_Update(sender, obj, sec, flags)
+	dbg_print("We made it to Update")
+
+	if true then
+        for k, v in pairs(sender.cont_to_str) do
+            sender:RemoveTrackedPartsContainer(k)
+        end
+        return
+    end
+	if not sender:Pass(obj, sec) then
+		sender:Show(false)
+		first_update = true
+		return
+	end
+
+	-- item info box is shown at cursor
+	sync_cursor(sender.dialog, sender.frame, 0, 0)
+
+	-- no need to process if it's same item
+	if not first_update then 
+		if obj then
+			if obj:id() == sender.id then
+				sender:Show(true)
+				return
+			end
+		elseif sec then
+			if sec == sender.section then
+				sender:Show(true)
+				return
+			end
+		end
+	end
+
+    
+
+	-- Tracked Items, displaying new info part
+	try(function()
+		-- Container name, must be defined in _init monkeypatch
+		local container_name = "tracked_items"
+
+		-- Remove container first for proper update
+		sender:RemoveTrackedPartsContainer(container_name)
+
+		-- Get all possible items to display
+		-- local inverse_compatible_item_to_item_tracker = get_inverse_compatible_item_to_item_tracker(sec)
+        -- local tracked_items = inverse_compatible_item_to_item_tracker[sec] or {}
+        local tracked_items = {}
+		-- local cooking = getCookableItems(sec)
+
+		-- If item table isnt empty
+		if is_not_empty(tracked_items) then 
+			-- Convert to plain array
+			local t = {}
+			for k, v in pairs(tracked_items) do
+				t[#t+1] = k
+			end
+
+			-- Add new container for icons. Check if next container of items is possible to be displayed and adjust offset accordingly
+			sender:AddTrackedPartsContainer(is_not_empty(tracked_items) and 16 or 40, t, container_name)
+
+			-- Synchronize tooltip height and place container in the tooltip
+			-- If stats container (weapons, outfits) is displayed, then put the container after it, otherwise put after description
+			-- sender:Sync_Finale( true, (sender.parts and sender.parts:IsShown() and sender.parts) or sender.desc, sender[container_name], sender.frame, 10 )
+			sender:Sync_Finale( true, (sender.parts and sender.parts:IsShown() and sender.parts) or sender.stats_dialog:IsShown() and sender.stats_dialog or sender.desc, sender[container_name], sender.frame, 10 )
+
+			-- Add caption to new container
+			sender:SyncTrackedPartsText(false, container_name,"Fallback Tracked String")
+
+			-- -- Move parts to the right of stats if frame is too big to fit screen
+			-- if sender.frame:GetHeight() > 768 then
+			-- 	sender:MoveTrackedItemsRightVertical(is_not_empty(tracked_items) and 8 or 0, t, container_name)
+			-- 	sender:Sync_Finale( true, nil, sender.desc, sender.frame, 10 )
+			-- end
+		end
+
+		sender:Show(true)
+    end)
+	first_update = false
+
+
+end
+
+function on_game_start()
+	-- Base_UIInfoItem_Init = utils_ui.UIInfoItem.__init
+	Base_UIInfoItem_Update = utils_ui.UIInfoItem.Update
+    utils_ui.UIInfoItem.Update = YM_UIInfoItem_Update
+end
